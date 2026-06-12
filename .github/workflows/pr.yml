@@ -1,7 +1,7 @@
-# PR validation: the full dry-run pipeline (minus soak) on every pull
-# request. Branch protection requires the final `ci-ok` summary job — a
-# single stable context that fails unless every stage succeeded, so matrix
-# renames can never silently deadlock merges.
+# PR validation: the security gates only — static audit, the license gates
+# (structural + ScanCode + npm tree + provenance), and the CodeQL gate.
+# The full dry-run chain (lint/test/build/smoke/soak) stays maintainer-driven
+# via workflow_dispatch. Branch protection requires `dco` + `ci-ok`.
 name: PR
 
 on:
@@ -16,46 +16,20 @@ jobs:
     uses: ./.github/workflows/_security.yml
     secrets: inherit
 
-  lint:
-    uses: ./.github/workflows/_lint.yml
-
-  test:
-    needs: [lint]
-    if: ${{ !cancelled() && needs.lint.result == 'success' }}
-    uses: ./.github/workflows/_test.yml
-    with:
-      # Perf assertions are timing-sensitive on shared runners; they stay in
-      # dry runs and releases where a flaky red does not block a merge.
-      skip_perf: true
-
-  build:
-    needs: [test]
-    if: ${{ !cancelled() && needs.test.result == 'success' }}
-    uses: ./.github/workflows/_build.yml
-
-  smoke:
-    needs: [build]
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
-    uses: ./.github/workflows/_smoke.yml
-
   ci-ok:
-    # The one required context (besides dco). Runs even when upstream jobs
-    # fail, and passes only when every stage succeeded.
-    needs: [security, lint, test, build, smoke]
+    # The one required context (besides dco) — a stable name that fails
+    # unless the security gates succeeded.
+    needs: [security]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: All stages must have succeeded
+      - name: Security gates must have succeeded
         env:
-          RESULTS: ${{ toJSON(needs) }}
+          RESULT: ${{ needs.security.result }}
         run: |
-          echo "$RESULTS" | python3 -c "
-          import json, sys
-          needs = json.load(sys.stdin)
-          bad = {k: v['result'] for k, v in needs.items() if v['result'] != 'success'}
-          if bad:
-              print('CI NOT OK:', bad)
-              sys.exit(1)
-          print('CI OK:', ', '.join(needs))
-          "
+          if [ "$RESULT" != "success" ]; then
+            echo "CI NOT OK: security=$RESULT"
+            exit 1
+          fi
+          echo "CI OK: security gates green"

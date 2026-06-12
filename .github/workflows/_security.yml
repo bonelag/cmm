@@ -46,7 +46,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          CURRENT_SHA="${{ github.sha }}"
+          # On pull_request events github.sha is the synthetic merge commit;
+          # CodeQL runs are recorded against the PR head SHA.
+          CURRENT_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
           echo "Waiting for CodeQL to complete on $CURRENT_SHA..."
           for attempt in $(seq 1 90); do
             LATEST=$(gh api repos/${{ github.repository }}/actions/workflows/codeql.yml/runs?per_page=5 \
