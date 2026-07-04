@@ -462,6 +462,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_new_cypher_limit_zero.c \
     tests/repro/repro_issue363.c \
     tests/repro/repro_issue581.c \
+    tests/repro/repro_issue787.c \
     tests/repro/repro_invariant_calls.c \
     tests/repro/repro_invariant_graph.c \
     tests/repro/repro_invariant_breadth.c \
@@ -482,6 +483,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_c_cpp.c \
     tests/repro/repro_lsp_go_py.c \
     tests/repro/repro_lsp_ts.c \
+    tests/repro/repro_ts_inherited_method.c \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
