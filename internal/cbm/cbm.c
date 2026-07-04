@@ -26,7 +26,8 @@
 #error "HAVE_LIBGIT2 requires libgit2 >= 1.7.0 for git_allocator"
 #endif
 #elif defined(LIBGIT2_VER_MAJOR) && defined(LIBGIT2_VER_MINOR) && defined(LIBGIT2_VER_REVISION)
-#if ((LIBGIT2_VER_MAJOR * 1000000) + (LIBGIT2_VER_MINOR * 10000) + (LIBGIT2_VER_REVISION * 100)) < 1070000
+#if ((LIBGIT2_VER_MAJOR * 1000000) + (LIBGIT2_VER_MINOR * 10000) + (LIBGIT2_VER_REVISION * 100)) < \
+    1070000
 #error "HAVE_LIBGIT2 requires libgit2 >= 1.7.0 for git_allocator"
 #endif
 #else
