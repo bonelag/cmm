@@ -98,6 +98,20 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include <string.h>
 #include <time.h>
 
+/* Back-pressure nap-cycle counter (test observability): each execution of the
+ * over-budget collect+nap gate counts one cycle. Lets tests assert the gate does
+ * not re-pay the full nap tax on every file pull when napping cannot reclaim
+ * memory (the resident floor, not in-flight transients, holds the budget). */
+static _Atomic long g_bp_nap_cycles = 0;
+
+long cbm_pp_bp_nap_cycles(void) {
+    return atomic_load_explicit(&g_bp_nap_cycles, memory_order_relaxed);
+}
+
+void cbm_pp_bp_nap_cycles_reset(void) {
+    atomic_store_explicit(&g_bp_nap_cycles, 0, memory_order_relaxed);
+}
+
 /* Parse a positive MB-valued retention env knob (CBM_RETAIN_*_MB) into bytes.
  * Follows the limits.c strtol convention: unset / unparseable / non-positive
  * → return 0 so the caller keeps its derived default. */
@@ -687,6 +701,13 @@ typedef struct {
      * path lock). Merged into the pipeline in the sequential merge loop. */
     pp_err_list_t *err_lists;
     _Atomic int oversized_warned; /* throttle for the index.file_oversized WARN */
+
+    /* Back-pressure futility latch: set when a full collect+nap cycle ended
+     * still over budget — the resident floor (graph + retained sources), not
+     * in-flight transients, holds the memory, so napping cannot reclaim it.
+     * While set, pulls skip the nap (the designed soft overshoot); the cheap
+     * over-budget probe re-arms the gate once RSS drains under budget. */
+    _Atomic int bp_futile;
 } extract_ctx_t;
 
 /* Cap on the number of index.file_oversized WARN lines (the full list still goes
@@ -763,14 +784,37 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * near the budget instead of letting all workers parse their biggest
          * files at once. Self-disabling when the budget is unset (tests) or RSS
          * is under budget; bounded spins avoid deadlock when the resident graph
-         * is itself near budget (then proceed with a soft overshoot). */
-        if (cbm_mem_budget() > 0 && cbm_mem_over_budget()) {
-            cbm_mem_collect();
-            for (int bp = 0; bp < PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget() &&
-                             !atomic_load_explicit(ec->cancelled, memory_order_relaxed);
-                 bp++) {
-                struct timespec nap = {0, PP_BACKPRESSURE_NAP_NS};
-                cbm_nanosleep(&nap, NULL);
+         * is itself near budget (then proceed with a soft overshoot).
+         *
+         * Futility latch: when a FULL nap cycle ends still over budget, the
+         * resident floor — not transients — holds the memory; napping again on
+         * the next pull cannot reclaim it and only idles workers (linux kernel:
+         * one full cycle per pull ≈ 390 s at 79% avg CPU). Latch bp_futile and
+         * proceed with the soft overshoot; the over-budget probe below re-arms
+         * the gate as soon as RSS drains under budget. */
+        if (cbm_mem_budget() > 0) {
+            bool over = cbm_mem_over_budget();
+            bool futile = atomic_load_explicit(&ec->bp_futile, memory_order_relaxed) != 0;
+            if (over && !futile) {
+                cbm_mem_collect();
+                atomic_fetch_add_explicit(&g_bp_nap_cycles, SKIP_ONE, memory_order_relaxed);
+                int bp = 0;
+                for (; bp < PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget() &&
+                       !atomic_load_explicit(ec->cancelled, memory_order_relaxed);
+                     bp++) {
+                    struct timespec nap = {0, PP_BACKPRESSURE_NAP_NS};
+                    cbm_nanosleep(&nap, NULL);
+                }
+                if (bp == PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget()) {
+                    /* Log only the 0→1 transition: all workers race into the
+                     * gate before anyone latches, so a plain store would WARN
+                     * once per worker (12 lines per latch event). */
+                    if (atomic_exchange_explicit(&ec->bp_futile, 1, memory_order_relaxed) == 0) {
+                        cbm_log_warn("mem.backpressure.futile", "action", "soft_overshoot");
+                    }
+                }
+            } else if (!over && futile) {
+                atomic_store_explicit(&ec->bp_futile, 0, memory_order_relaxed);
             }
         }
 
@@ -1075,6 +1119,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     atomic_init(&ec.retained_bytes, 0);
     atomic_init(&ec.retain_cap_warned, 0);
     atomic_init(&ec.oversized_warned, 0);
+    atomic_init(&ec.bp_futile, 0);
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
@@ -1347,6 +1392,16 @@ typedef struct {
      * cbm_run_X_lsp_cross_with_registry — skip per-file build entirely.
      * Stored as CBMCrossLspRegistries* (typedef from pass_lsp_cross.h). */
     CBMCrossLspRegistries *cross_registries;
+
+    /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
+     * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
+     * all filter to subsets never pay the O(all_defs) build + multi-GB RSS. Built
+     * under rust_shared_mu into rust_shared_arena, published via rust_shared_reg;
+     * torn down after the worker dispatch. */
+    _Atomic(CBMTypeRegistry *) rust_shared_reg;
+    cbm_mutex_t rust_shared_mu;
+    CBMArena rust_shared_arena;
+    bool rust_shared_arena_live;
 
     /* Counters for parallel.resolve.lsp_cross_done summary. */
     _Atomic int lsp_cross_processed;
@@ -2501,6 +2556,34 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
     }
 }
 
+/* F4: get (or lazily build ONCE) the shared all_defs Rust registry. Called by the
+ * first worker that hits a NULL-filter rust file; later null-files reuse it. Fast
+ * path is a lock-free atomic load; the build happens under rust_shared_mu into the
+ * dedicated rust_shared_arena (never a shared pipeline arena from a worker thread).
+ * Returns NULL if there are no defs (caller falls back to the per-file build). */
+static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
+    CBMTypeRegistry *p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_acquire);
+    if (p)
+        return p;
+    if (!rc->all_defs || rc->def_count <= 0)
+        return NULL;
+    cbm_mutex_lock(&rc->rust_shared_mu);
+    p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_relaxed);
+    if (!p) {
+        cbm_arena_init(&rc->rust_shared_arena);
+        rc->rust_shared_arena_live = true;
+        p = cbm_rust_build_cross_registry(&rc->rust_shared_arena, rc->all_defs, rc->def_count);
+        if (p) {
+            char sb[96];
+            snprintf(sb, sizeof(sb), "types=%d funcs=%d", p->type_count, p->func_count);
+            cbm_log_info("cross_lsp.rust_registry", "scale", sb);
+        }
+        atomic_store_explicit(&rc->rust_shared_reg, p, memory_order_release);
+    }
+    cbm_mutex_unlock(&rc->rust_shared_mu);
+    return p;
+}
+
 static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
@@ -2753,8 +2836,26 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                             file_def_count = filtered_count;
                         }
                     }
-                    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
-                        lang == CBM_LANG_TSX) {
+                    if (lang == CBM_LANG_RUST && !filtered) {
+                        /* Rust NULL-filter file (the ~all_defs amplifier) → resolve against
+                         * the LAZILY-built shared registry instead of rebuilding all_defs
+                         * per file. Byte-identical: a per-file all_defs build == the shared
+                         * all_defs build (def_module_qn always set). SUBSET rust files
+                         * (filtered != NULL) fall to the per-file build below, unchanged.
+                         * Manifest via the getter = same value cbm_pxc_run_one reads here. */
+                        CBMTypeRegistry *shared = pp_rust_shared_registry(rc);
+                        if (shared) {
+                            cbm_run_rust_lsp_cross_with_registry(
+                                &result->arena, lsp_source, lsp_source_len, def_module, shared,
+                                imp_keys, imp_vals, imp_count, result->cached_tree,
+                                cbm_pxc_get_rust_manifest(), &result->resolved_calls,
+                                /*result=*/NULL);
+                        } else {
+                            cbm_pxc_run_one(lang, result, lsp_source, lsp_source_len, def_module,
+                                            file_defs, file_def_count, imp_keys, imp_vals, imp_count);
+                        }
+                    } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                               lang == CBM_LANG_TSX) {
                         bool js, jsx, dts;
                         cbm_pxc_ts_modes(lang, rel, &js, &jsx, &dts);
                         cbm_pxc_run_one_ts(result, lsp_source, lsp_source_len, def_module,
@@ -2893,6 +2994,10 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
     atomic_init(&rc.lsp_cross_skipped_no_source, 0);
+    /* F4 lazy shared Rust registry: mutex up before workers spawn. */
+    atomic_init(&rc.rust_shared_reg, NULL);
+    cbm_mutex_init(&rc.rust_shared_mu);
+    rc.rust_shared_arena_live = false;
 
     /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
@@ -2900,6 +3005,14 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_parallel_for(worker_count, resolve_worker, &rc, opts);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
+    /* Workers joined: the shared Rust registry (if built) is no longer read.
+     * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
+     * all QNs, so freeing all_defs afterward is safe). */
+    if (rc.rust_shared_arena_live) {
+        cbm_arena_destroy(&rc.rust_shared_arena);
+        rc.rust_shared_arena_live = false;
+    }
+    cbm_mutex_destroy(&rc.rust_shared_mu);
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
     CBM_PROF_START(t_resolve_merge);

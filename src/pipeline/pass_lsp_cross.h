@@ -35,6 +35,7 @@
 #include "lsp/c_lsp.h"  /* cbm_c_build_cross_registry / cbm_run_c_lsp_cross_with_registry */
 #include "lsp/cs_lsp.h" /* cbm_cs_build_cross_registry / cbm_run_cs_lsp_cross_with_registry */
 #include "lsp/ts_lsp.h" /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
+#include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
 #include "pipeline/pipeline_internal.h"
 #include <stdbool.h>
 
@@ -107,6 +108,8 @@ typedef struct {
     CBMTypeRegistry *ts;     /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
     CBMTypeRegistry *php;    /* CBM_LANG_PHP */
     CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
+    /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
+     * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
 
 /* Return the appropriate pre-built registry for a language, or NULL
@@ -133,9 +136,15 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
     case CBM_LANG_CSHARP:
         return r->cs;
     default:
-        return NULL;
+        return NULL; /* incl. CBM_LANG_RUST — its shared registry is built lazily */
     }
 }
+
+/* Borrow the (thread-local) Rust Cargo manifest the cross-file LSP pass set for
+ * cross-crate (#56) routing. The Tier-2 prebuilt Rust resolve reads it so it sees
+ * exactly what the per-file fallback (cbm_pxc_run_one) would on the same thread. */
+struct CBMCargoManifest;
+const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
